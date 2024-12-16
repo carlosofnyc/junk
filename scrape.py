@@ -10,6 +10,8 @@ import logging
 import time
 from typing import List, Dict, Any, Optional
 from functools import wraps
+from snowflake.connector import connect
+from snowflake.connector.pandas_tools import write_pandas
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -49,9 +51,9 @@ class ApartmentScraper:
         driver = self.init_driver()
         links = []
         try:
-            driver.get('https://joinlifex.com/copenhagen/homes')
+            driver.get('https://joinlifex.com/berlin/homes')
             elements = WebDriverWait(driver, 10).until(
-                EC.presence_of_all_elements_located((By.CSS_SELECTOR, "a[href^='/copenhagen/homes/']"))
+                EC.presence_of_all_elements_located((By.CSS_SELECTOR, "a[href^='/berlin/homes/']"))
             )
             links = [elem.get_attribute('href') for elem in elements]
             logging.info(f"Found {len(links)} apartment links")
@@ -68,9 +70,8 @@ class ApartmentScraper:
             for unit in listing.get('bookableUnits', []):
                 room = unit['room']
                 rent = unit['rent']
-                
-                # Calculate move-in costs
-                total_move_in = self.deposit + (2 * rent)  # Deposit + first and last month
+            
+                total_move_in = self.deposit + (2 * rent)
                 
                 room_info = {
                     'Room Name': f"Room {room['name']}",
@@ -90,7 +91,6 @@ class ApartmentScraper:
                 }
                 rooms_info.append(room_info)
             
-            # Calculate availability status
             has_available_rooms = any(room['Available'] == 'Yes' for room in rooms_info)
             available_rooms_count = sum(1 for room in rooms_info if room['Available'] == 'Yes')
             
@@ -133,13 +133,11 @@ def main():
                 continue
 
         if all_apartments:
-            # Create apartments DataFrame
             apartments_df = pd.DataFrame([
                 {key: value for key, value in apt.items() if key != "Rooms"}
                 for apt in all_apartments
             ])
 
-            # Create rooms DataFrame
             rooms_data = []
             for apartment in all_apartments:
                 for room in apartment["Rooms"]:
@@ -149,15 +147,46 @@ def main():
             
             rooms_df = pd.DataFrame(rooms_data)
 
-            # Sort and save to Excel
             apartments_df = apartments_df.sort_values('Apartment Name')
             rooms_df = rooms_df.sort_values(['Apartment Name', 'Monthly Rent'])
 
-            with pd.ExcelWriter("lifex.xlsx", engine='openpyxl') as writer:
+            combined_df = pd.merge(apartments_df, rooms_df, on="Apartment Name", how="outer")
+
+            conn = connect(
+                account='lb31978.eu-north-1.aws',
+                user='carlos',
+                password='nukmId-gikzud-bizxo2',
+                warehouse='scrape',
+                database='scrape_db',
+                schema='s_scrape'
+            )
+
+            try:
+                conn.cursor().execute(f"USE SCHEMA {conn.schema}")
+                
+                success, nchunks, nrows, _ = write_pandas(
+                    conn,
+                    combined_df,
+                    'scraped_berlin',
+                    auto_create_table=True,
+                    overwrite=True
+                )
+
+                if success:
+                    logging.info(f"Successfully wrote {nrows} rows to Snowflake table 'scraped_berlin'")
+                else:
+                    logging.error("Failed to write data to Snowflake")
+            except Exception as e:
+                logging.error(f"Error writing to Snowflake: {str(e)}")
+            finally:
+                conn.close()
+
+            # still save to excel
+            with pd.ExcelWriter("berlin.xlsx", engine='openpyxl') as writer:
                 apartments_df.to_excel(writer, sheet_name="Apartments", index=False)
                 rooms_df.to_excel(writer, sheet_name="Rooms", index=False)
             
-            logging.info("Data saved to lifex.xlsx")
+            logging.info("Data saved to berlin.xlsx")
         else:
             logging.warning("No apartments found")
     finally:
